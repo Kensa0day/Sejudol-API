@@ -1,0 +1,13 @@
+flask
+flask-cors
+pymysql
+transformers
+torch
+pandas
+numpy
+nltk
+sastrawi
+python-dotenv
+requests
+joblib
+openpyxl
