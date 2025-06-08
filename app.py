@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from joblib import load as joblib_load
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+# from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 from crawler import crawl_and_return
 import asyncio
 import nltk
@@ -23,6 +23,11 @@ DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_USER = os.getenv("DB_USER", "root")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "sentiment_db")
+
+# di awal file
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+HF_API_URL          = "https://api-inference.huggingface.co/models/w11wo/indonesian-roberta-base-sentiment-classifier"
+HEADERS             = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 
 # App
 app = Flask(__name__)
@@ -42,10 +47,10 @@ svm_pipeline = joblib_load("pipeline_svm_best.joblib")
 # svm_pipeline = joblib_load("pipeline_svm_all.joblib")
 
 # Load IndoBERT
-MODEL_PATH = "my-finetuned-bert"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-bert_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-bert_pipeline = pipeline("text-classification", model=bert_model, tokenizer=tokenizer)
+# MODEL_PATH = "my-finetuned-bert"
+# tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+# bert_model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
+# bert_pipeline = pipeline("text-classification", model=bert_model, tokenizer=tokenizer)
 
 # Risiko Keywords
 RISK_KEYWORDS = ["slot", "judol", "ngeslot", "pinjol", "gacor", "jp", "depo", "spin", "wd", "jackpot", "togel"]
@@ -120,21 +125,12 @@ def crawl_tweets():
         return jsonify({"error": str(e)}), 500
 
 
-hf_pipe = pipeline(
-    "text-classification",
-    model="w11wo/indonesian-roberta-base-sentiment-classifier",
-    tokenizer="w11wo/indonesian-roberta-base-sentiment-classifier",
-    return_all_scores=False
-)
-# ──────────────────────────────────────────────────────────────────────────────
-# Preprocess + Klasifikasi SVM-only (Overwrite sentiment)
+
 
 @app.route("/preprocess", methods=["POST"])
-def preprocess_with_huggingface_local():
+def preprocess_with_hf_api():
     conn   = get_db_connection()
     cursor = conn.cursor(pymysql.cursors.DictCursor)
-
-    # Ambil baris yang belum diproses
     cursor.execute("""
         SELECT id, text
           FROM comments
@@ -150,27 +146,51 @@ def preprocess_with_huggingface_local():
         cid, raw_text = row["id"], row["text"]
         try:
             # 1) Clean & normalize
-            cleaned    = clean_text(raw_text)                      # lower+strip urls/mentions/punct
-            normalized = normalize_text(cleaned)                   # ganti slang
+            cleaned    = clean_text(raw_text)
+            normalized = normalize_text(cleaned)
 
-            # 2) Precompute stemmed only for DB storage (optional)
-            stemmed    = " ".join(stem_words(remove_stopwords(normalized.split())))
+            # 2) Prepare stemmed for DB storage
+            tokens     = normalized.split()
+            filtered   = remove_stopwords(tokens)
+            stemmed    = " ".join(stem_words(filtered))
 
-            # 3) Prediksi dengan HF memakai **normalized** (bukan stemmed!)
-            hf_res = hf_pipe(normalized, truncation=True)[0]       # gunakan normalized
-            lbl    = hf_res["label"].lower()
-            sc     = float(hf_res["score"])
-            if "positive" in lbl or "label_2" in lbl:
-                sentiment = "positif"
-            elif "negative" in lbl or "label_0" in lbl:
-                sentiment = "negatif"
-            else:
-                sentiment = "netral"
+            # 3) Call HF Inference API (use normalized text)
+            # 3) Call HF Inference API (use normalized text)
+            payload = {"inputs": normalized, "options": {"wait_for_model": True}}
+            resp    = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=30)
+            resp.raise_for_status()
+            result  = resp.json()
 
-            # 4) Risk flag pakai cleaned
+            # 4) Normalize the nested list/dict response into a single dict `hf_obj`
+            hf_obj = None
+            if isinstance(result, list) and result:
+                first = result[0]
+                # Jika first adalah list, ambil elemen pertamanya
+                if isinstance(first, list) and first:
+                    hf_obj = first[0]
+                # Jika first sudah dict
+                elif isinstance(first, dict):
+                    hf_obj = first
+
+            # 5) Map API response to our labels
+            sentiment  = "unknown"
+            confidence = 0.0
+            if isinstance(hf_obj, dict):
+                lbl = hf_obj.get("label", "").lower()
+                sc  = hf_obj.get("score", 0.0)
+                confidence = float(sc)
+                if "positive" in lbl:
+                    sentiment = "positif"
+                elif "negative" in lbl:
+                    sentiment = "negatif"
+                elif "neutral" in lbl:
+                    sentiment = "netral"
+
+
+            # 5) Risk flag
             risk_flag = 1 if detect_risk(cleaned) else 0
 
-            # 5) Update DB: simpan stemmed teks di cleaning, bukan untuk inference
+            # 6) Update database
             cursor.execute("""
                 UPDATE comments
                    SET cleaning    = %s,
@@ -178,18 +198,21 @@ def preprocess_with_huggingface_local():
                        confidence  = %s,
                        risk_flag   = %s
                  WHERE id = %s
-            """, (stemmed, sentiment, sc, risk_flag, cid))
+            """, (stemmed, sentiment, confidence, risk_flag, cid))
 
             total += 1
 
         except Exception as e:
             app.logger.error(f"Error processing id={cid}: {e}", exc_info=True)
+            # skip this row
             continue
 
     conn.commit()
     cursor.close()
     conn.close()
-    return jsonify({"status":"success","total_processed": total}), 200
+
+    return jsonify({"status": "success", "total_processed": total}), 200
+
 
 
 
@@ -288,14 +311,14 @@ def preprocess_with_huggingface_local():
 @app.route("/predict", methods=["POST"])
 def predict_sentiment():
     data = request.get_json() or {}
-    comment = data.get("komentar")
+    comment = data.get("komentar", "")
 
     if not comment or not isinstance(comment, str):
         return jsonify({"error": "Komentar tidak valid"}), 400
 
     # 1) Preprocessing
     cleaned_basic = clean_text(comment)
-    normalized    = normalize_text(cleaned_basic)       # hanya 1 argumen
+    normalized    = normalize_text(cleaned_basic)
     tokens        = normalized.split()
     filtered      = remove_stopwords(tokens)
     stemmed       = stem_words(filtered)
@@ -308,49 +331,67 @@ def predict_sentiment():
     # 3) SVM
     raw_pred_svm = svm_pipeline.predict([stemmed])[0]
     decision     = svm_pipeline.decision_function([stemmed])[0]
-    if isinstance(decision, np.ndarray):
-        score_svm = float(max(decision))
-    else:
-        score_svm = float(decision)
-    conf_svm = float(1.0 / (1.0 + np.exp(-score_svm)))
+    score_svm    = float(max(decision)) if isinstance(decision, np.ndarray) else float(decision)
+    conf_svm     = 1.0 / (1.0 + np.exp(-score_svm))
 
-    # 4) IndoBERT
-    bert_result    = bert_pipeline(cleaned_basic)[0]
-    bert_label     = bert_result["label"]
-    bert_score     = float(bert_result["score"])
-    bert_label_map = {"LABEL_0": "negatif", "LABEL_1": "netral", "LABEL_2": "positif"}
-    bert_sentiment = bert_label_map.get(bert_label, bert_label)
-    if bert_score < 0.58:
-        bert_sentiment = "netral"
+    # 4) Hugging Face Inference API
+    try:
+        resp = requests.post(
+        HF_API_URL,
+        headers=HEADERS,
+        json={
+            "inputs": [normalized],
+            "options": {"wait_for_model": True}
+        }, timeout=60
+        )
 
-    # 5) HuggingFace Roberta‐base
-    hf_res = hf_pipe(normalized, truncation=True)[0]
-    hf_lbl = hf_res["label"].lower()   # misal "LABEL_0" atau "positive"
-    hf_sc  = float(hf_res["score"])
-    if "positive" in hf_lbl or "label_2" in hf_lbl:
-        hf_sentiment = "positif"
-    elif "negative" in hf_lbl or "label_0" in hf_lbl:
-        hf_sentiment = "negatif"
-    else:
-        hf_sentiment = "netral"
+        app.logger.info(f"HF API status={resp.status_code}, body={resp.text}")
+        resp.raise_for_status()
+       
+        result = resp.json()
+        # bisa jadi [[{...}]]
+        if isinstance(result, list) and result and isinstance(result[0], list):
+            hf_obj = result[0][0]
+        elif isinstance(result, list) and result:
+            hf_obj = result[0]
+        else:
+            hf_obj = {}
 
-    # 6) Risk flag
+        lbl = hf_obj.get("label", "").lower()
+        sc  = hf_obj.get("score", 0.0)
+        hf_conf = float(sc)
+        if "positive" in lbl:
+            hf_sentiment = "positif"
+        elif "negative" in lbl:
+            hf_sentiment = "negatif"
+        elif "neutral" in lbl:
+            hf_sentiment = "netral"
+        else:
+            hf_sentiment = "unknown"
+        
+    except Exception as e:
+        app.logger.error(f"HF Inference error: {e}", exc_info=True)
+        hf_sentiment = "unknown"
+        hf_conf = 0.0
+
+    # 5) Risk flag
     risk_flag_val = 1 if detect_risk(cleaned_basic) else 0
 
-    # 7) Mapping Naive Bayes
+    # 6) Mapping Naive Bayes label
     if isinstance(pred_nb, (int, np.integer)):
         nb_label_map = {0: "negatif", 1: "netral", 2: "positif"}
         nb_sentiment = nb_label_map.get(int(pred_nb), "unknown")
     else:
         nb_sentiment = str(pred_nb)
 
-    # 8) Mapping SVM
+    # 7) Mapping SVM label
     if isinstance(raw_pred_svm, (int, np.integer)):
         svm_label_map = {0: "negatif", 1: "netral", 2: "positif"}
         svm_sentiment = svm_label_map.get(int(raw_pred_svm), "unknown")
     else:
         svm_sentiment = str(raw_pred_svm)
 
+    # 8) Kembalikan semua hasil
     return jsonify({
         "input": comment,
         "naive_bayes": {
@@ -361,13 +402,9 @@ def predict_sentiment():
             "sentiment": svm_sentiment,
             "confidence": round(conf_svm, 4)
         },
-        "indobert": {
-            "sentiment": bert_sentiment,
-            "confidence": round(bert_score, 4)
-        },
         "huggingface": {
             "sentiment": hf_sentiment,
-            "confidence": round(hf_sc, 4)
+            "confidence": round(hf_conf, 4)
         },
         "risk_flag": risk_flag_val
     }), 200
