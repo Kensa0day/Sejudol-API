@@ -19,16 +19,16 @@ nltk.download('stopwords')
 
 # Load .env
 load_dotenv()
-# DB_HOST = os.getenv("DB_HOST", "localhost")
-# DB_USER = os.getenv("DB_USER", "root")
-# DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-# DB_NAME = os.getenv("DB_NAME", "sentiment_db")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "sentiment_db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+# DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_db_connection():
-    # Connect ke Neon via DATABASE_URL (dengan pgbouncer)
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+# def get_db_connection():
+#     # Connect ke Neon via DATABASE_URL (dengan pgbouncer)
+#     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 # di awal file
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
@@ -39,9 +39,9 @@ HEADERS             = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
 app = Flask(__name__)
 CORS(app)
 
-# Database Connection
-# def get_db_connection():
-#     return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
+Database Connection
+def get_db_connection():
+    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db=DB_NAME)
 
 # Load Models
 # NB: tfidf_vectorizer dipakai hanya untuk Naive Bayes
